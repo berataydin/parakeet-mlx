@@ -1,6 +1,8 @@
+import math
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -72,8 +74,21 @@ class ParakeetTDTCTCArgs(ParakeetTDTArgs):
 
 # API
 @dataclass
+class Greedy:
+    pass
+
+
+@dataclass
+class Beam:
+    beam_size: int = 5
+    length_penalty: float = 1.0
+    patience: float = 1.0
+    duration_reward: float = 0.7  # TDT-only
+
+
+@dataclass
 class DecodingConfig:
-    decoding: str = "greedy"
+    decoding: Union[Greedy, Beam] = field(default_factory=Greedy)
     sentence: SentenceConfig = field(default_factory=SentenceConfig)
 
 
@@ -88,6 +103,14 @@ class BaseParakeet(nn.Module):
         self.encoder_config = encoder_args
 
         self.encoder = Conformer(encoder_args)
+
+    @property
+    def time_ratio(self) -> float:
+        return (
+            self.encoder_config.subsampling_factor
+            / self.preprocessor_config.sample_rate
+            * self.preprocessor_config.hop_length
+        )
 
     def generate(
         self, mel: mx.array, *, decoding_config: DecodingConfig = DecodingConfig()
@@ -271,9 +294,245 @@ class ParakeetTDT(BaseParakeet):
         config: DecodingConfig = DecodingConfig(),
     ) -> tuple[list[list[AlignedToken]], list[Optional[tuple[mx.array, mx.array]]]]:
         """Run TDT decoder with features, optional length and decoder state. Outputs list[list[AlignedToken]] and updated hidden state"""
-        assert config.decoding == "greedy", (
-            "Only greedy decoding is supported for TDT decoder now"
-        )
+        mx.eval(features)
+
+        match config.decoding:
+            case Greedy():
+                return self.decode_greedy(
+                    features, lengths, last_token, hidden_state, config=config
+                )
+            case Beam():
+                return self.decode_beam(
+                    features, lengths, last_token, hidden_state, config=config
+                )
+            case _:
+                raise NotImplementedError(
+                    f"{config.decoding} is not supported in TDT models."
+                )
+
+    def decode_beam(
+        self,
+        features: mx.array,
+        lengths: Optional[mx.array] = None,
+        last_token: Optional[list[Optional[int]]] = None,
+        hidden_state: Optional[list[Optional[tuple[mx.array, mx.array]]]] = None,
+        *,
+        config: DecodingConfig = DecodingConfig(),
+    ) -> tuple[list[list[AlignedToken]], list[Optional[tuple[mx.array, mx.array]]]]:
+        assert isinstance(config.decoding, Beam)  # type guarntee
+
+        beam_token = min(config.decoding.beam_size, len(self.vocabulary) + 1)
+        beam_duration = min(config.decoding.beam_size, len(self.durations))
+        max_candidates = round(config.decoding.beam_size * config.decoding.patience)
+
+        @dataclass
+        class Hypothesis:
+            score: float
+            step: int
+            last_token: Optional[int]
+            hidden_state: Optional[tuple[mx.array, mx.array]]
+            stuck: int
+            hypothesis: list[AlignedToken]
+
+            def __hash__(self) -> int:
+                return hash((self.step, tuple((x.id for x in self.hypothesis))))
+
+        B, S, *_ = features.shape
+
+        if hidden_state is None:
+            hidden_state = list([None] * B)
+
+        if lengths is None:
+            lengths = mx.array([S] * B)
+
+        if last_token is None:
+            last_token = list([None] * B)
+
+        results = []
+        results_hidden = []
+        for batch in range(B):
+            feature = features[batch : batch + 1]
+            length = int(lengths[batch])
+
+            finished_hypothesis: list[Hypothesis] = []
+            active_beam: list[Hypothesis] = [
+                Hypothesis(
+                    score=0.0,
+                    step=0,
+                    last_token=last_token[batch],
+                    hidden_state=hidden_state[batch],
+                    stuck=0,
+                    hypothesis=[],
+                )
+            ]
+
+            while len(finished_hypothesis) < max_candidates and active_beam:
+                candidates: Dict[int, Hypothesis] = {}
+
+                for hypothesis in active_beam:
+                    decoder_out, (hidden, cell) = self.decoder(
+                        mx.array([[hypothesis.last_token]])
+                        if hypothesis.last_token is not None
+                        else None,
+                        hypothesis.hidden_state,
+                    )
+                    decoder_out = decoder_out.astype(feature.dtype)
+                    decoder_hidden = (
+                        hidden.astype(feature.dtype),
+                        cell.astype(feature.dtype),
+                    )
+
+                    joint_out = self.joint(
+                        feature[:, hypothesis.step : hypothesis.step + 1], decoder_out
+                    )
+
+                    token_logits, duration_logits = (
+                        joint_out[0, 0, 0, : len(self.vocabulary) + 1],
+                        joint_out[0, 0, 0, len(self.vocabulary) + 1 :],
+                    )
+                    token_logprobs, duration_logprobs = (
+                        nn.log_softmax(token_logits, -1),
+                        nn.log_softmax(duration_logits, -1),
+                    )
+
+                    # raw python ops might be faster from here
+                    token_k, duration_k = (
+                        typing.cast(
+                            List[int],
+                            mx.argpartition(token_logprobs, -beam_token)[
+                                -beam_token:
+                            ].tolist(),
+                        ),
+                        typing.cast(
+                            List[int],
+                            mx.argpartition(duration_logprobs, -beam_duration)[
+                                -beam_duration:
+                            ].tolist(),
+                        ),
+                    )
+
+                    # for faster accessing
+                    token_logprobs = typing.cast(List[float], token_logprobs.tolist())
+                    duration_logprobs = typing.cast(
+                        List[float], duration_logprobs.tolist()
+                    )
+
+                    for token in token_k:
+                        is_blank = token == len(self.vocabulary)
+                        for decision in duration_k:
+                            duration = self.durations[decision]
+                            stuck = 0 if duration != 0 else hypothesis.stuck + 1
+
+                            if (
+                                self.max_symbols is not None
+                                and stuck >= self.max_symbols
+                            ):
+                                step = hypothesis.step + 1
+                                stuck = 0
+                            else:
+                                step = hypothesis.step + duration
+
+                            new_hypotheis = Hypothesis(
+                                score=hypothesis.score
+                                + token_logprobs[token]
+                                * (1 - config.decoding.duration_reward)
+                                + duration_logprobs[decision]
+                                * (config.decoding.duration_reward),
+                                step=step,
+                                last_token=hypothesis.last_token if is_blank else token,
+                                hidden_state=hypothesis.hidden_state
+                                if is_blank
+                                else decoder_hidden,
+                                stuck=stuck,
+                                hypothesis=hypothesis.hypothesis
+                                if is_blank
+                                else (
+                                    list(hypothesis.hypothesis)
+                                    + [
+                                        AlignedToken(
+                                            id=token,
+                                            start=hypothesis.step
+                                            * self.time_ratio,  # hop
+                                            duration=duration * self.time_ratio,  # hop
+                                            confidence=math.exp(
+                                                token_logprobs[token]
+                                                + duration_logprobs[decision]
+                                            ),
+                                            text=tokenizer.decode(
+                                                [token], self.vocabulary
+                                            ),
+                                        )
+                                    ]
+                                ),
+                            )
+
+                            # merge if anyone took same path
+                            key = hash(new_hypotheis)
+                            if key in candidates:
+                                other_hypothesis = candidates[key]
+
+                                # log sum exp
+                                maxima = max(
+                                    other_hypothesis.score, new_hypotheis.score
+                                )
+                                score = maxima + math.log(
+                                    math.exp(other_hypothesis.score - maxima)
+                                    + math.exp(new_hypotheis.score - maxima)
+                                )
+
+                                if new_hypotheis.score > other_hypothesis.score:
+                                    candidates[key] = new_hypotheis
+                                candidates[key].score = score
+                            else:
+                                candidates[key] = new_hypotheis
+
+                finished_hypothesis.extend(
+                    [
+                        hypothesis
+                        for hypothesis in candidates.values()
+                        if hypothesis.step >= length
+                    ]
+                )
+                active_beam = sorted(
+                    [
+                        hypothesis
+                        for hypothesis in candidates.values()
+                        if hypothesis.step < length
+                    ],
+                    key=lambda x: x.score,
+                    reverse=True,
+                )[: config.decoding.beam_size]
+
+            finished_hypothesis = finished_hypothesis + active_beam
+
+            if not finished_hypothesis:
+                results.append([])
+                results_hidden.append(hidden_state[batch])
+            else:
+                length_penalty = (
+                    config.decoding.length_penalty
+                )  # mypy assumes weirdly so we go in safe way
+
+                best = max(
+                    finished_hypothesis,
+                    key=lambda x: x.score
+                    / (max(1, len(x.hypothesis)) ** length_penalty),
+                )
+                results.append(best.hypothesis)
+                results_hidden.append(best.hidden_state)
+
+        return results, results_hidden
+
+    def decode_greedy(
+        self,
+        features: mx.array,
+        lengths: Optional[mx.array] = None,
+        last_token: Optional[list[Optional[int]]] = None,
+        hidden_state: Optional[list[Optional[tuple[mx.array, mx.array]]]] = None,
+        *,
+        config: DecodingConfig = DecodingConfig(),
+    ) -> tuple[list[list[AlignedToken]], list[Optional[tuple[mx.array, mx.array]]]]:
+        assert isinstance(config.decoding, Greedy)  # type guarntee
 
         B, S, *_ = features.shape
 
@@ -333,14 +592,8 @@ class ParakeetTDT(BaseParakeet):
                     hypothesis.append(
                         AlignedToken(
                             int(pred_token),
-                            start=step
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
-                            duration=self.durations[decision]
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
+                            start=step * self.time_ratio,
+                            duration=self.durations[decision] * self.time_ratio,
                             confidence=confidence,
                             text=tokenizer.decode([pred_token], self.vocabulary),
                         )
@@ -409,7 +662,7 @@ class ParakeetRNNT(BaseParakeet):
         config: DecodingConfig = DecodingConfig(),
     ) -> tuple[list[list[AlignedToken]], list[Optional[tuple[mx.array, mx.array]]]]:
         """Run TDT decoder with features, optional length and decoder state. Outputs list[list[AlignedToken]] and updated hidden state"""
-        assert config.decoding == "greedy", (
+        assert isinstance(config.decoding, Greedy), (
             "Only greedy decoding is supported for RNNT decoder now"
         )
 
@@ -467,14 +720,8 @@ class ParakeetRNNT(BaseParakeet):
                     hypothesis.append(
                         AlignedToken(
                             int(pred_token),
-                            start=step
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
-                            duration=1
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
+                            start=step * self.time_ratio,
+                            duration=1 * self.time_ratio,
                             confidence=confidence,
                             text=tokenizer.decode([pred_token], self.vocabulary),
                         )
@@ -560,19 +807,9 @@ class ParakeetCTC(BaseParakeet):
                     continue
 
                 if prev_token != -1:
-                    token_start_time = (
-                        token_boundaries[-1][0]
-                        * self.encoder_config.subsampling_factor
-                        / self.preprocessor_config.sample_rate
-                        * self.preprocessor_config.hop_length
-                    )
+                    token_start_time = token_boundaries[-1][0] * self.time_ratio
 
-                    token_end_time = (
-                        t
-                        * self.encoder_config.subsampling_factor
-                        / self.preprocessor_config.sample_rate
-                        * self.preprocessor_config.hop_length
-                    )
+                    token_end_time = t * self.time_ratio
 
                     token_duration = token_end_time - token_start_time
 
