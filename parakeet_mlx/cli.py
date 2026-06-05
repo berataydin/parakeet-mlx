@@ -170,6 +170,18 @@ def to_json(result: AlignedResult) -> str:
     }
     return json.dumps(output_dict, indent=2, ensure_ascii=False)
 
+def show_version(do: bool):
+    if not do:
+        return
+
+    try:
+        import importlib.metadata
+        version = importlib.metadata.version("parakeet-mlx")
+    except importlib.metadata.PackageNotFoundError:
+        version = "dev"
+    print(f"parakeet-mlx {version}")
+    
+    raise typer.Exit(0)
 
 @app.command("transcribe")
 def transcribe(
@@ -314,6 +326,15 @@ def transcribe(
         typer.Option(
             help="Directory for HuggingFace model cache. If not specified, uses HF's default cache location",
             envvar="PARAKEET_CACHE_DIR",
+        ),
+    ] = None,
+    version: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--version",
+            callback=show_version,
+            is_eager=True,
+            help="Show the package version"
         ),
     ] = None,
 ):
